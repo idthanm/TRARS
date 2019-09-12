@@ -7,7 +7,7 @@ Benjamin Recht
 
 
 import numpy as np
-from filter import get_filter
+from codeee.filter import get_filter
 
 class Policy(object):
 
