@@ -250,8 +250,7 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
         rollout_rewards, deltas_idx = [], []
         accumulated_matrix = np.zeros((self.ob_size, self.ob_size), dtype=np.float32)
 
-
-        for result in results_one:
+        for result in results_one:  # one result corresponds to one deltas
             if not evaluate:
                 self.timesteps += result["steps"]
             deltas_idx += result['deltas_idx']
@@ -264,8 +263,6 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
             deltas_idx += result['deltas_idx']
             rollout_rewards += result['rollout_rewards']
             accumulated_matrix += result['accumulated_matrix']
-
-
 
         deltas_idx = np.array(deltas_idx)
         average_matrix = accumulated_matrix / deltas_idx.size
