@@ -4,7 +4,6 @@
 import ray
 import numpy as np
 
-@ray.remote
 def create_shared_noise():
     """
     Create a large array of noise to be shared by all workers. Used 

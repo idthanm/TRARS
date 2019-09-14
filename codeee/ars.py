@@ -18,8 +18,8 @@ import codeee.optimizers as optimizers
 from codeee.policies import *
 import socket
 from codeee.shared_noise import *
+import tensorflow as tf
 
-@ray.remote
 class Worker(object):
     """ 
     Object class for parallel rollout generation.
@@ -49,6 +49,9 @@ class Worker(object):
         self.delta_std = delta_std
         self.rollout_length = rollout_length
 
+        self.action_size = self.env.action_space.shape[0]
+        self.ob_size = self.env.observation_space.shape[0]
+
         
     def get_weights_plus_stats(self):
         """ 
@@ -56,7 +59,10 @@ class Worker(object):
         """
         assert self.policy_params['type'] == 'linear'
         return self.policy.get_weights_plus_stats()
-    
+
+    def _calculate_small_accumulate_matrix(self, processed_ob):
+        processed_ob = np.reshape(processed_ob, (1, self.ob_size))
+        return np.matmul(processed_ob.transpose(), processed_ob)
 
     def rollout(self, shift = 0., rollout_length = None):
         """ 
@@ -69,17 +75,19 @@ class Worker(object):
 
         total_reward = 0.
         steps = 0
+        accumulated_matrix = np.zeros((self.ob_size, self.ob_size), dtype=np.float32)
 
         ob = self.env.reset()
         for i in range(rollout_length):
-            action = self.policy.act(ob)
+            action, processed_ob = self.policy.act(ob)
+            accumulated_matrix += self._calculate_small_accumulate_matrix(processed_ob)
             ob, reward, done, _ = self.env.step(action)
             steps += 1
             total_reward += (reward - shift)
             if done:
                 break
             
-        return total_reward, steps
+        return total_reward, steps, accumulated_matrix
 
     def do_rollouts(self, w_policy, num_rollouts = 1, shift = 1, evaluate = False):
         """ 
@@ -88,6 +96,8 @@ class Worker(object):
 
         rollout_rewards, deltas_idx = [], []
         steps = 0
+        accumulated_matrix = np.zeros((self.ob_size, self.ob_size), dtype=np.float32)
+
 
         for i in range(num_rollouts):
 
@@ -100,7 +110,7 @@ class Worker(object):
 
                 # for evaluation we do not shift the rewards (shift = 0) and we use the
                 # default rollout length (1000 for the MuJoCo locomotion tasks)
-                reward, r_steps = self.rollout(shift = 0.)
+                reward, r_steps, accumulated_matrix = self.rollout(shift = 0.)
                 rollout_rewards.append(reward)
                 
             else:
@@ -114,16 +124,18 @@ class Worker(object):
 
                 # compute reward and number of timesteps used for positive perturbation rollout
                 self.policy.update_weights(w_policy + delta)
-                pos_reward, pos_steps  = self.rollout(shift = shift)
+                pos_reward, pos_steps, pos_accumulated_matrix = self.rollout(shift = shift)
 
                 # compute reward and number of timesteps used for negative pertubation rollout
                 self.policy.update_weights(w_policy - delta)
-                neg_reward, neg_steps = self.rollout(shift = shift) 
+                neg_reward, neg_steps, neg_accumulated_matrix = self.rollout(shift = shift)
                 steps += pos_steps + neg_steps
+                accumulated_matrix += pos_accumulated_matrix + neg_accumulated_matrix
 
                 rollout_rewards.append([pos_reward, neg_reward])
                             
-        return {'deltas_idx': deltas_idx, 'rollout_rewards': rollout_rewards, "steps" : steps}
+        return {'deltas_idx': deltas_idx, 'rollout_rewards': rollout_rewards, "steps" : steps,
+                'accumulated_matrix': accumulated_matrix}
     
     def stats_increment(self):
         self.policy.observation_filter.stats_increment()
@@ -180,19 +192,19 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
         
         # create shared table for storing noise
         print("Creating deltas table.")
-        deltas_id = create_shared_noise.remote()
-        self.deltas = SharedNoiseTable(ray.get(deltas_id), seed = seed + 3)
+        deltas_id = create_shared_noise()
+        self.deltas = SharedNoiseTable(deltas_id, seed = seed + 3)
         print('Created deltas table.')
 
         # initialize workers with different random seeds
         print('Initializing workers.') 
         self.num_workers = num_workers
-        self.workers = [Worker.remote(seed + 7 * i,
-                                      env_name=env_name,
-                                      policy_params=policy_params,
-                                      deltas=deltas_id,
-                                      rollout_length=rollout_length,
-                                      delta_std=delta_std) for i in range(num_workers)]
+        self.workers = [Worker(seed + 7 * i,
+                               env_name=env_name,
+                               policy_params=policy_params,
+                               deltas=deltas_id,
+                               rollout_length=rollout_length,
+                               delta_std=delta_std) for i in range(num_workers)]
 
 
         # initialize policy 
@@ -217,41 +229,48 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
             num_deltas = num_rollouts
             
         # put policy weights in the object store
-        policy_id = ray.put(self.w_policy)
+        policy_id = self.w_policy
 
         t1 = time.time()
         num_rollouts = int(num_deltas / self.num_workers)
             
         # parallel generation of rollouts
-        rollout_ids_one = [worker.do_rollouts.remote(policy_id,
-                                                 num_rollouts = num_rollouts,
-                                                 shift = self.shift,
-                                                 evaluate=evaluate) for worker in self.workers]
+        rollout_ids_one = [worker.do_rollouts(policy_id,
+                                              num_rollouts = num_rollouts,
+                                              evaluate=evaluate) for worker in self.workers]
 
-        rollout_ids_two = [worker.do_rollouts.remote(policy_id,
-                                                 num_rollouts = 1,
-                                                 shift = self.shift,
-                                                 evaluate=evaluate) for worker in self.workers[:(num_deltas % self.num_workers)]]
+        rollout_ids_two = [worker.do_rollouts(policy_id,
+                                              num_rollouts = 1,
+                                              evaluate=evaluate) for worker in self.workers[:(num_deltas % self.num_workers)]]
 
         # gather results 
-        results_one = ray.get(rollout_ids_one)
-        results_two = ray.get(rollout_ids_two)
+        results_one = rollout_ids_one
+        results_two = rollout_ids_two
 
-        rollout_rewards, deltas_idx = [], [] 
+        rollout_rewards, deltas_idx = [], []
+        accumulated_matrix = np.zeros((self.ob_size, self.ob_size), dtype=np.float32)
+
 
         for result in results_one:
             if not evaluate:
                 self.timesteps += result["steps"]
             deltas_idx += result['deltas_idx']
             rollout_rewards += result['rollout_rewards']
+            accumulated_matrix += result['accumulated_matrix']
 
         for result in results_two:
             if not evaluate:
                 self.timesteps += result["steps"]
             deltas_idx += result['deltas_idx']
             rollout_rewards += result['rollout_rewards']
+            accumulated_matrix += result['accumulated_matrix']
+
+
 
         deltas_idx = np.array(deltas_idx)
+        average_matrix = accumulated_matrix / deltas_idx.size
+        average_matrix_inv = np.linalg.inv(average_matrix)
+
         rollout_rewards = np.array(rollout_rewards, dtype = np.float64)
         
         print('Maximum reward of collected rollouts:', rollout_rewards.max())
@@ -272,7 +291,7 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
         rollout_rewards = rollout_rewards[idx,:]
         
         # normalize rewards by their standard deviation
-        rollout_rewards /= np.std(rollout_rewards)
+        # rollout_rewards /= np.std(rollout_rewards)
 
         t1 = time.time()
         # aggregate rollouts to form g_hat, the gradient used to compute SGD step
@@ -281,9 +300,17 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
                                                    for idx in deltas_idx),
                                                   batch_size = 500)
         g_hat /= deltas_idx.size
+        grad = np.matmul(average_matrix_inv, g_hat[0 * self.ob_size: 1 * self.ob_size])
+        for i in range(1, self.action_size):
+            part_i = np.matmul(average_matrix_inv, g_hat[i * self.ob_size: (i+1) * self.ob_size])
+            grad = np.concatenate((grad, part_i), axis=0)
+
+        quantity_for_stepsize = np.dot(grad, g_hat)
+        g_hat = grad
+
         t2 = time.time()
         print('time to aggregate rollouts', t2 - t1)
-        return g_hat
+        return g_hat, quantity_for_stepsize
         
 
     def train_step(self):
@@ -291,8 +318,11 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
         Perform one update step of the policy weights.
         """
         
-        g_hat = self.aggregate_rollouts()                    
+        g_hat, quantity_for_stepsize = self.aggregate_rollouts()
         print("Euclidean norm of update step:", np.linalg.norm(g_hat))
+        stepsize = self.optimizer.stepsize
+        stepsize = min(stepsize, np.sqrt(2 * stepsize / quantity_for_stepsize))
+        self.optimizer.stepsize = stepsize
         self.w_policy -= self.optimizer._compute_step(g_hat).reshape(self.w_policy.shape)
         return
 
@@ -311,7 +341,7 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
             if ((i + 1) % 10 == 0):
                 
                 rewards = self.aggregate_rollouts(num_rollouts = 100, evaluate = True)
-                w = ray.get(self.workers[0].get_weights_plus_stats.remote())
+                w = self.workers[0].get_weights_plus_stats()
                 np.savez(self.logdir + "/lin_policy_plus", w)
                 
                 print(sorted(self.params.items()))
@@ -327,20 +357,18 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
             t1 = time.time()
             # get statistics from all workers
             for j in range(self.num_workers):
-                self.policy.observation_filter.update(ray.get(self.workers[j].get_filter.remote()))
+                self.policy.observation_filter.update(self.workers[j].get_filter())
             self.policy.observation_filter.stats_increment()
 
             # make sure master filter buffer is clear
             self.policy.observation_filter.clear_buffer()
             # sync all workers
-            filter_id = ray.put(self.policy.observation_filter)
-            setting_filters_ids = [worker.sync_filter.remote(filter_id) for worker in self.workers]
+            filter_id = self.policy.observation_filter
+            setting_filters_ids = [worker.sync_filter(filter_id) for worker in self.workers]
             # waiting for sync of all workers
-            ray.get(setting_filters_ids)
-         
-            increment_filters_ids = [worker.stats_increment.remote() for worker in self.workers]
+
+            increment_filters_ids = [worker.stats_increment() for worker in self.workers]
             # waiting for increment of all workers
-            ray.get(increment_filters_ids)            
             t2 = time.time()
             print('Time to sync statistics:', t2 - t1)
                         
@@ -393,7 +421,7 @@ if __name__ == '__main__':
     parser.add_argument('--deltas_used', '-du', type=int, default=8)
     parser.add_argument('--step_size', '-s', type=float, default=0.02)
     parser.add_argument('--delta_std', '-std', type=float, default=.03)
-    parser.add_argument('--n_workers', '-e', type=int, default=18)
+    parser.add_argument('--n_workers', '-e', type=int, default=4)
     parser.add_argument('--rollout_length', '-r', type=int, default=1000)
 
     # for Swimmer-v1 and HalfCheetah-v1 use shift = 0
@@ -408,8 +436,7 @@ if __name__ == '__main__':
     parser.add_argument('--filter', type=str, default='MeanStdFilter')
 
     local_ip = socket.gethostbyname(socket.gethostname())
-    ray.init()  # redis_address= local_ip + ':6379'
-    
+
     args = parser.parse_args()
     params = vars(args)
     run_ars(params)

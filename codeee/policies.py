@@ -48,7 +48,7 @@ class LinearPolicy(Policy):
 
     def act(self, ob):
         ob = self.observation_filter(ob, update=self.update_filter)
-        return np.dot(self.weights, ob)
+        return np.dot(self.weights, ob), ob
 
     def get_weights_plus_stats(self):
         
