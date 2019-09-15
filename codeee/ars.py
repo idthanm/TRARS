@@ -20,6 +20,8 @@ import socket
 from codeee.shared_noise import *
 import tensorflow as tf
 
+
+@ray.remote()
 class Worker(object):
     """ 
     Object class for parallel rollout generation.
@@ -199,7 +201,7 @@ class ARSLearner(object):  # like trainer in rllib, create workers, optimizer, a
         # initialize workers with different random seeds
         print('Initializing workers.') 
         self.num_workers = num_workers
-        self.workers = [Worker(seed + 7 * i,
+        self.workers = [Worker.remote(seed + 7 * i,
                                env_name=env_name,
                                policy_params=policy_params,
                                deltas=deltas_id,
@@ -433,6 +435,7 @@ if __name__ == '__main__':
     parser.add_argument('--filter', type=str, default='MeanStdFilter')
 
     local_ip = socket.gethostbyname(socket.gethostname())
+    ray.init()
 
     args = parser.parse_args()
     params = vars(args)
